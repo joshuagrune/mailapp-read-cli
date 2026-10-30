@@ -26,6 +26,8 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+from email import policy
+from email.parser import Parser
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -64,6 +66,10 @@ class MailError(RuntimeError):
     pass
 
 
+class MailAutomationUnavailable(MailError):
+    """Mail's scripting bridge is unavailable in the current execution context."""
+
+
 @dataclass
 class MessageRow:
     id: int
@@ -100,6 +106,18 @@ def run_osascript(source: str) -> str:
     )
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "osascript failed").strip()
+        if "com.apple.hiservices-xpcservice" in detail and "invalid" in detail.lower():
+            raise MailAutomationUnavailable(
+                "Mail.app automation is unavailable in this execution context. "
+                "A shell sandbox can block Mail's scripting dictionary and produce "
+                "misleading AppleScript syntax errors. Retry the read command in an "
+                "authorized unsandboxed context; do not rewrite AppleScript based on this error."
+            )
+        if "-1743" in detail:
+            raise MailAutomationUnavailable(
+                "Mail.app automation permission was denied (-1743). Check macOS "
+                "Privacy & Security > Automation for the calling app."
+            )
         raise MailError(detail)
     return proc.stdout.strip()
 
@@ -117,7 +135,7 @@ def load_account_map() -> dict[str, str]:
         if len(parts) % 2:
             raise MailError(f"Unexpected account list from Mail.app: {raw!r}")
         half = len(parts) // 2
-        mapping = {uuid: name for name, uuid in zip(parts[:half], parts[half:], strict=True)}
+        mapping = {uuid: name for name, uuid in zip(parts[:half], parts[half:])}
     except MailError as exc:
         mapping = load_account_map_from_accounts_db()
         if not mapping:
@@ -509,6 +527,8 @@ def full_body_search(
             bodies_fetched += 1
             try:
                 body = fetch_message_body(msg, body_chars)
+            except MailAutomationUnavailable:
+                raise
             except MailError:
                 body = ""
             if body and text_matches(body, patterns):
@@ -573,6 +593,9 @@ def enrich_senders(messages: list[MessageRow]) -> None:
                 continue
         for msg in messages:
             msg.sender = by_id.get(msg.id, "")
+    except MailAutomationUnavailable as exc:
+        print(f"Warning: sender lookup unavailable: {exc}", file=sys.stderr)
+        return
     except MailError:
         for msg in messages:
             try:
@@ -627,6 +650,8 @@ end tell
 '''
     try:
         return run_osascript(source)
+    except MailAutomationUnavailable:
+        raise
     except MailError:
         fallback = f'''
 tell application "Mail"
@@ -660,8 +685,27 @@ end tell
 '''
     try:
         return run_osascript(source)
+    except MailAutomationUnavailable:
+        raise
     except MailError:
         return ""
+
+
+def fetch_attachment_names(message: MessageRow) -> list[str]:
+    """Parse MIME filenames; Mail's attachment object specifiers can be unstable."""
+    account = escape_applescript(message.account)
+    mailbox = escape_applescript(message.mailbox)
+    source = f'''
+tell application "Mail"
+  set msgRef to first message of mailbox "{mailbox}" of account "{account}" whose id is {message.id}
+  return source of msgRef
+end tell
+'''
+    raw = run_osascript(source)
+    if not raw:
+        raise MailError("Mail.app returned an empty message source; attachment absence is unverified.")
+    parsed = Parser(policy=policy.default).parsestr(raw)
+    return [name for part in parsed.walk() if (name := part.get_filename())]
 
 
 def save_attachment(message: MessageRow, index: int, out_path: Path) -> Path:
@@ -713,8 +757,8 @@ def print_messages(messages: list[MessageRow]) -> None:
         return
     for msg in messages:
         unread = "unread" if msg.unread else "read"
-        sender = f" | {msg.sender}" if msg.sender else ""
-        print(f"[{msg.id}] {msg.date} | {msg.account} | {unread}{sender}")
+        sender = f" | from={msg.sender}" if msg.sender else ""
+        print(f"[{msg.id}] {msg.date} | account={msg.account} | {unread}{sender}")
         print(f"  {msg.subject}")
         if msg.snippet:
             print(f"  > {msg.snippet}")
@@ -921,12 +965,17 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 def cmd_attachments(args: argparse.Namespace) -> int:
     message = fetch_message_meta(args.id)
-    names = message.attachments or []
+    live = getattr(args, "live", False)
+    names = fetch_attachment_names(message) if live else (message.attachments or [])
+    source = "mailapp_mime" if live else "local_index"
     if args.json:
-        print(json.dumps({"id": message.id, "attachments": names}, indent=2, ensure_ascii=False))
+        print(json.dumps({"id": message.id, "attachments": names, "source": source}, indent=2, ensure_ascii=False))
         return 0
     if not names:
-        print("No attachments.")
+        if live:
+            print("No attachments in Mail.app.")
+        else:
+            print("No attachments recorded in the local index. This does not prove absence; use --live to check Mail.app.")
         return 0
     for idx, name in enumerate(names, start=1):
         print(f"{idx}\t{name}")
@@ -1146,6 +1195,7 @@ Default lookback is 365 days (override with --days / --since / --until).
 
     p_attach = sub.add_parser("attachments", parents=[common], help="List attachments")
     p_attach.add_argument("id", type=int)
+    p_attach.add_argument("--live", action="store_true", help="Read attachment names from Mail.app instead of the local index")
     p_attach.set_defaults(func=cmd_attachments)
 
     p_save = sub.add_parser("save", help="Save one attachment via Mail.app")

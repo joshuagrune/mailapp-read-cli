@@ -32,10 +32,29 @@ python3 apple_mail.py search "term1|term2" [--body] [--full-body] [--since YYYY-
 python3 apple_mail.py show MESSAGE_ID [--body-chars 1200]
 python3 apple_mail.py context --days 3
 python3 apple_mail.py attachments MESSAGE_ID
+python3 apple_mail.py attachments MESSAGE_ID --live
 python3 apple_mail.py save MESSAGE_ID --index 1 --out ~/Downloads/file.ics
 ```
 
 Add `--json` on read commands for structured output.
+
+`attachments` uses the local index by default. An empty index entry does not
+prove an email lacked attachments, especially for Gmail Sent copies. Use
+`attachments MESSAGE_ID --live` to read the actual attachment names from
+the MIME message source returned by Mail.app. Mail's attachment object
+specifiers can yield unstable names when iterated; the original MIME filenames
+are authoritative. JSON output includes `source: local_index` or
+`source: mailapp_mime`.
+
+The plain listing labels `account=` and `from=` separately. An account label is
+not the sender. If sender lookup is unavailable, a warning goes to stderr;
+full-body searches fail instead of reporting incomplete results as no matches.
+
+An agent shell sandbox can prevent Mail's scripting dictionary from loading,
+producing `com.apple.hiservices-xpcservice` connection errors together with
+misleading AppleScript syntax errors. Run the necessary read operation in an
+authorized unsandboxed context. Automation permission errors (`-1743`) require
+checking macOS Privacy & Security > Automation for the calling app.
 
 ### Search highlights
 
